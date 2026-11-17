@@ -1,0 +1,83 @@
+name: Build skinned shell
+
+# Builds only the iOS shell (no Windows tools, no smoke test, no release) from upstream nxnative at the commit this fork
+# is based on (.shell-base.txt) plus this fork's files, and leaves the zip as a downloadable artifact of the run.
+# Start it by hand: Actions -> "Build skinned shell" -> Run workflow.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  shell:
+    runs-on: xcode-27        # GitHub's own macOS image with Xcode 27 (the iOS 27 SDK the shell needs)
+    timeout-minutes: 60
+    steps:
+      - name: Check out this fork
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Assemble the source tree
+        run: |
+          set -euxo pipefail
+          BASE=$(tr -d '[:space:]' < fork/.shell-base.txt)
+          git init -q up
+          git -C up remote add origin https://github.com/seedds/nxnative.git
+          git -C up fetch --depth 1 origin "$BASE"
+          git -C up checkout -q FETCH_HEAD
+          # files this fork adds: copied as they are
+          while IFS= read -r line; do
+            p="${line#+}"; p="${p%%#*}"; p="$(echo "$p" | tr -d '[:space:]')"
+            [ -n "$p" ] || continue
+            mkdir -p "up/$(dirname "$p")"
+            if [ -d "fork/$p" ]; then cp -a "fork/$p" "up/$(dirname "$p")/"; else cp -a "fork/$p" "up/$p"; fi
+          done < <(grep -E '^\+' fork/.shell-overlay.txt)
+          # files this fork modifies: patched onto upstream's copy -- except DmGamepad.m, which is copied whole (see below)
+          PATCHDIR="$(pwd)/fork/.shell-patches"
+          n=0
+          for f in "$PATCHDIR"/*.patch; do
+            [ -e "$f" ] || continue
+            [ "$(basename "$f")" = "dm__ios__Sources__DmGamepad.m.patch" ] && continue
+            git -C up apply --whitespace=nowarn "$f" || { echo "::error::$(basename "$f") does not apply"; exit 1; }
+            n=$((n+1))
+          done
+          echo "applied $n patches"
+          # The upstream commit is pinned to the fork's base, so this fork's own DmGamepad.m (its patch plus the skins) is
+          # exactly what the patched file would be: copying it whole avoids pasting a whitespace-sensitive .patch by hand.
+          grep -q 'skin_dir' fork/dm/ios/Sources/DmGamepad.m || { echo "::error::dm/ios/Sources/DmGamepad.m in the fork has no skin code: paste the new file"; exit 1; }
+          cp fork/dm/ios/Sources/DmGamepad.m up/dm/ios/Sources/DmGamepad.m
+          echo "TREE=$GITHUB_WORKSPACE/up" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          python3 -m pip install --quiet --break-system-packages fonttools || python3 -m pip install --quiet fonttools
+
+      - name: Build the shell
+        env:
+          DM_ROOT: ${{ runner.temp }}/dm-work
+        run: |
+          set -euo pipefail
+          cd "$TREE"
+          xcrun --sdk iphoneos --show-sdk-version
+          bash dm/ios/tools/shell_build.sh 2>&1 | tee "$RUNNER_TEMP/shell.out"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$DM_ROOT/build/shell/nxnative-shell-build-input.zip" "$GITHUB_WORKSPACE/dist/shell-skins-$(date -u +%Y%m%d).zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shell-with-skins
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload the build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-build-log
+          path: |
+            ${{ runner.temp }}/dm-work/build/shell/build.log
+            ${{ runner.temp }}/dm-work/build/shell/xcodegen.log
+            ${{ runner.temp }}/shell.out
+          if-no-files-found: ignore
