@@ -155,6 +155,9 @@ static void pads_start(void);   // Physical controllers, below
     NSMapTable<UITouch *, NSNumber *> *_faceOf;    // which keys each touch on the diamond currently holds
     CAShapeLayer *_key[B_N]; CATextLayer *_label[B_N];   // one layer per key
     CAShapeLayer *_ring, *_knob;                   // the left stick (the right one is not drawn)
+    // Skins (dm/skin/*.png, see skin_dir): an image per key laid over its shape, which then draws nothing
+    CALayer *_skin[B_N]; UIImage *_skinImg[B_N], *_skinImgOn[B_N]; BOOL _armRot[B_N];
+    CALayer *_ringSkin, *_knobSkin; UIImage *_knobImg, *_knobImgOn; BOOL _menuSkin;
     DmMenuButton *_menu;                           // opens the in-game menu (GameMenu.swift)
     UIImpactFeedbackGenerator *_touchFeedback;       // one short feedback per touch-control press edge
     unsigned _hapticSticks;
@@ -166,6 +169,33 @@ static void pads_start(void);   // Physical controllers, below
     UITouch *_game[16];                            // touches on the game's touch screen by finger slot
 }
 
+// ---- Skins ----
+// PNG files replace the drawn controls; every file is optional and a missing one leaves that control as it was.
+// The folder is the first of: $DM_SKIN_DIR, $DM_APP_DM/skin (this game's own dm folder), Documents/ns2ios/skin (the Files app), the
+// bundle's dm/skin. File names: a b x y l r zl zr plus minus l3 r3, up right down left (or dpad_arm, drawn pointing up, turned for the
+// other three), stick_ring, stick_knob, menu. Add _on to a name for the pressed picture (name_on.png); without one the key dims.
+static const char *const k_skin_names[B_N] = {"a", "b", "x", "y", "l3", "r3", "l", "r", "zl", "zr", "plus", "minus", "left", "up", "right", "down"};
+static NSString *skin_dir(void) {
+    static NSString *dir; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableArray<NSString *> *c = [NSMutableArray array];
+        const char *e = getenv("DM_SKIN_DIR"); if (e && *e) [c addObject:@(e)];
+        const char *g = getenv("DM_APP_DM"); if (g && *g) [c addObject:[@(g) stringByAppendingPathComponent:@"skin"]];
+        NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (doc) [c addObject:[doc stringByAppendingPathComponent:@"ns2ios/skin"]];
+        [c addObject:[NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"dm/skin"]];
+        for (NSString *d in c) { BOOL isDir = NO; if ([NSFileManager.defaultManager fileExistsAtPath:d isDirectory:&isDir] && isDir) { dir = d; break; } }
+    });
+    return dir;
+}
+static UIImage *skin_image(NSString *name) {
+    NSString *d = skin_dir(); if (!d) return nil;
+    return [UIImage imageWithContentsOfFile:[d stringByAppendingPathComponent:[name stringByAppendingString:@".png"]]];
+}
+static CALayer *skin_layer(CALayer *parent, UIImage *img) {
+    CALayer *l = [CALayer layer]; l.contents = (__bridge id)img.CGImage; l.contentsGravity = kCAGravityResizeAspect; l.contentsScale = img.scale;
+    [parent addSublayer:l]; return l;
+}
 static UIColor *k_idle, *k_on, *k_line, *k_ringFill, *k_text, *k_textOn;
 static CAShapeLayer *shape(CALayer *parent) {
     CAShapeLayer *l = [CAShapeLayer layer];
@@ -209,6 +239,20 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
             _key[b] = shape(_controls);
             if (names[b]) _label[b] = label(_key[b], names[b]);   // the D-pad arms carry no label
         }
+        for (int b = 0; b < B_N; b++) {   // skins: the image goes in the key's layer; the key's own shape, shadow and letter are switched off
+            NSString *n = @(k_skin_names[b]);
+            UIImage *img = skin_image(n), *on = skin_image([n stringByAppendingString:@"_on"]);
+            if (!img && b >= B_LEFT) { img = skin_image(@"dpad_arm"); on = skin_image(@"dpad_arm_on"); _armRot[b] = img != nil; }
+            if (!img) continue;
+            _skinImg[b] = img; _skinImgOn[b] = on; _skin[b] = skin_layer(_key[b], img);
+            _key[b].fillColor = nil; _key[b].strokeColor = nil; _key[b].shadowOpacity = 0; _label[b].hidden = YES;
+        }
+        UIImage *ringImg = skin_image(@"stick_ring"), *knobImg = skin_image(@"stick_knob");
+        if (ringImg) { _ringSkin = skin_layer(_ring, ringImg); _ring.fillColor = nil; _ring.strokeColor = nil; _ring.shadowOpacity = 0; }
+        if (knobImg) {
+            _knobImg = knobImg; _knobImgOn = skin_image(@"stick_knob_on"); _knobSkin = skin_layer(_knob, knobImg);
+            _knob.fillColor = nil; _knob.strokeColor = nil; _knob.shadowOpacity = 0; in.hidden = YES;
+        }
         _menu = [DmMenuButton buttonWithType:UIButtonTypeCustom];
         _menu.backgroundColor = k_idle; _menu.layer.borderColor = k_line.CGColor; _menu.layer.borderWidth = 1.5;
         _menu.layer.shadowColor = UIColor.blackColor.CGColor; _menu.layer.shadowOpacity = 0.2; _menu.layer.shadowRadius = 3; _menu.layer.shadowOffset = CGSizeMake(0, 1);
@@ -216,6 +260,12 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
         _menu.menu = CFBridgingRelease(dm_game_menu()); _menu.showsMenuAsPrimaryAction = YES;
         __weak DmGamepad *weakSelf = self;
         [_menu addAction:[UIAction actionWithHandler:^(UIAction *a) { (void)a; [weakSelf reset]; }] forControlEvents:UIControlEventMenuActionTriggered];   // the menu opens: release every key and touch first
+        UIImage *menuImg = skin_image(@"menu");
+        if (menuImg) {
+            _menuSkin = YES; _menu.backgroundColor = nil; _menu.layer.borderWidth = 0; _menu.layer.shadowOpacity = 0;
+            [_menu setImage:[menuImg imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal] forState:UIControlStateNormal];
+            _menu.imageView.contentMode = UIViewContentModeScaleAspectFit;
+        }
         [self addSubview:_menu];
         // First-launch layout from the game profile (DM_PAD_LAYOUT, atoi; the profile writes simple / full / touch and the packer turns it
         // into 0 / 1 / 2, the order game.py uses). The game-free shell is compiled against the placeholder profile, which asks for full:
@@ -542,23 +592,47 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
     CGFloat mr = K_MENU_R * u; CGPoint mc = self.menuCenter;
     _menu.frame = CGRectMake(mc.x - mr, mc.y - mr, 2 * mr, 2 * mr); _menu.layer.cornerRadius = mr;
     _menu.layer.shadowPath = [UIBezierPath bezierPathWithOvalInRect:_menu.bounds].CGPath;
-    [_menu setImage:[UIImage systemImageNamed:@"gearshape.fill" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13 * u weight:UIImageSymbolWeightSemibold]] forState:UIControlStateNormal];
+    if (!_menuSkin) [_menu setImage:[UIImage systemImageNamed:@"gearshape.fill" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13 * u weight:UIImageSymbolWeightSemibold]] forState:UIControlStateNormal];
     setPath(_ring, circlePath(self.stickHome, [self stickR:0]));
     CGFloat k = K_KNOB_R * u; _knob.bounds = CGRectMake(0, 0, 2 * k, 2 * k);
     setPath(_knob, circlePath(CGPointMake(k, k), k));
     CAShapeLayer *in = (CAShapeLayer *)_knob.sublayers.firstObject; CGPathRef ip = circlePath(CGPointMake(k, k), k * 0.62);
     in.frame = _knob.bounds; in.path = ip; CGPathRelease(ip);
+    [self layoutSkins];
     [CATransaction commit];
     [self refresh];
+}
+- (void)putSkin:(int)b at:(CGPoint)c size:(CGSize)sz angle:(CGFloat)a {   // an image layer centred on c; the D-pad's turned arm is rotated about its centre
+    CALayer *l = _skin[b]; if (!l) return;
+    l.affineTransform = CGAffineTransformIdentity; l.bounds = CGRectMake(0, 0, sz.width, sz.height); l.position = c;
+    if (_armRot[b]) l.affineTransform = CGAffineTransformMakeRotation(a);
+}
+- (void)layoutSkins {   // each skin fills the bounding square (a pill: its rectangle) of the control it replaces
+    CGFloat u = self.u;
+    for (int b = B_A; b <= B_Y; b++) { CGFloat r = self.faceR; [self putSkin:b at:[self facePos:b] size:CGSizeMake(2 * r, 2 * r) angle:0]; }
+    for (int i = 0; i < (int)(sizeof k_btns / sizeof *k_btns); i++) { int b = k_btns[i];
+        if (isDrop(b)) { CGFloat r = [self dropR:b]; [self putSkin:b at:[self dropCenter:b] size:CGSizeMake(2 * r, 2 * r) angle:0]; }
+        else if (isClick(b)) { CGFloat r = K_CLICK_R * u; [self putSkin:b at:[self clickCenter:b] size:CGSizeMake(2 * r, 2 * r) angle:0]; }
+        else { CGRect rc = [self pillRect:b]; [self putSkin:b at:CGPointMake(CGRectGetMidX(rc), CGRectGetMidY(rc)) size:rc.size angle:0]; }
+    }
+    static const struct { int b; CGFloat angle; } arms[] = {{B_UP, 0}, {B_RIGHT, M_PI_2}, {B_DOWN, M_PI}, {B_LEFT, -M_PI_2}};
+    CGFloat dr = self.dpadR;
+    for (int i = 0; i < 4; i++) [self putSkin:arms[i].b at:self.dpadCenter size:CGSizeMake(2 * dr, 2 * dr) angle:arms[i].angle];
+    if (_ringSkin) { CGFloat r = [self stickR:0]; _ringSkin.bounds = CGRectMake(0, 0, 2 * r, 2 * r); _ringSkin.position = self.stickHome; }
+    if (_knobSkin) _knobSkin.frame = _knob.bounds;
 }
 - (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; [self setNeedsLayout]; }
 - (void)refresh {   // pressed state → fill, sticks → knob position
     uint64_t all = _faceBits | _dpadBits | _btnBits;
     [CATransaction begin]; [CATransaction setDisableActions:YES];
     for (int b = 0; b < B_N; b++) { BOOL on = (all >> b) & 1;
-        _key[b].fillColor = (on ? k_on : k_idle).CGColor; _label[b].foregroundColor = (on ? k_textOn : k_text).CGColor; }
+        if (_skin[b]) { UIImage *im = on && _skinImgOn[b] ? _skinImgOn[b] : _skinImg[b]; _skin[b].contents = (__bridge id)im.CGImage; _skin[b].opacity = on && !_skinImgOn[b] ? 0.65f : 1; }
+        else _key[b].fillColor = (on ? k_on : k_idle).CGColor;
+        _label[b].foregroundColor = (on ? k_textOn : k_text).CGColor; }
     CGPoint h = self.stickHome, o = [self knobOffset:0];
-    _knob.position = CGPointMake(h.x + o.x, h.y + o.y); _knob.fillColor = (_stick[0] ? k_on : k_idle).CGColor;
+    _knob.position = CGPointMake(h.x + o.x, h.y + o.y);
+    if (_knobSkin) { UIImage *im = _stick[0] && _knobImgOn ? _knobImgOn : _knobImg; _knobSkin.contents = (__bridge id)im.CGImage; _knobSkin.opacity = _stick[0] && !_knobImgOn ? 0.8f : 1; }
+    else _knob.fillColor = (_stick[0] ? k_on : k_idle).CGColor;
     [CATransaction commit];
 }
 
